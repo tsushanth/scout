@@ -321,11 +321,13 @@ SYSTEM = (
 )
 
 
+THINKING_MODELS = {"claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"}
+
+
 def parse(client, schema, instruction: str, context: str, issue: str, model: str = MODEL):
-    return client.messages.parse(
+    kwargs = dict(
         model=model,
         max_tokens=16000,
-        thinking={"type": "adaptive"},
         system=SYSTEM,
         messages=[{
             "role": "user",
@@ -336,7 +338,10 @@ def parse(client, schema, instruction: str, context: str, issue: str, model: str
             ),
         }],
         output_format=schema,
-    ).parsed_output
+    )
+    if any(model.startswith(m) for m in THINKING_MODELS):
+        kwargs["thinking"] = {"type": "adaptive"}
+    return client.messages.parse(**kwargs).parsed_output
 
 
 def triage(client, context, issue) -> Triage:
