@@ -29,8 +29,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -190,6 +193,64 @@ def gather_context(root: Path, issue: str) -> str:
 
 # ---- LLM steps
 
+# ---- remote mode: fetch a GitHub issue + its repo via `gh`
+
+ISSUE_URL_RE = re.compile(r"https?://github\.com/([^/]+)/([^/]+)/issues/(\d+)")
+MAX_COMMENTS = 6
+MAX_COMMENT_CHARS = 1200
+
+
+def parse_issue_url(url: str) -> tuple[str, str, int]:
+    m = ISSUE_URL_RE.match(url.strip())
+    if not m:
+        sys.exit(f"Not a github issue URL (need .../owner/repo/issues/N): {url}")
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def fetch_issue_text(owner: str, repo: str, number: int) -> str:
+    """Render the issue (title/state/labels/body + top comments) as one blob.
+
+    Comments matter for the pre-filter: maintainer guidance and 'I'll take
+    this' claims live there, and they're exactly what tells fixable-with-a-
+    clear-path apart from unclaimed-but-murky.
+    """
+    try:
+        out = subprocess.check_output(
+            ["gh", "issue", "view", str(number), "--repo", f"{owner}/{repo}",
+             "--json", "title,body,state,labels,comments"],
+            text=True, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"gh issue view failed: {e.stderr.strip() or e}")
+    d = json.loads(out)
+    parts = [
+        f"TITLE: {d.get('title', '')}",
+        f"STATE: {d.get('state', '')}",
+        f"LABELS: {', '.join(l.get('name', '') for l in d.get('labels', []))}",
+        "", d.get("body") or "(no body)",
+    ]
+    comments = d.get("comments") or []
+    if comments:
+        parts.append("\n--- COMMENTS ---")
+        for c in comments[:MAX_COMMENTS]:
+            who = (c.get("author") or {}).get("login", "?")
+            parts.append(f"\n[{who}]: {(c.get('body') or '')[:MAX_COMMENT_CHARS]}")
+        if len(comments) > MAX_COMMENTS:
+            parts.append(f"\n... (+{len(comments) - MAX_COMMENTS} more comments)")
+    return "\n".join(parts)
+
+
+def clone_repo(owner: str, repo: str, dest: str) -> None:
+    """Shallow-clone the default branch (auth via gh, so private repos work)."""
+    try:
+        subprocess.check_call(
+            ["gh", "repo", "clone", f"{owner}/{repo}", dest, "--", "--depth=1", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"clone failed for {owner}/{repo}: {e}")
+
+
 def claude_code_oauth_token() -> str | None:
     """Read the Claude Code OAuth access token from the macOS keychain.
 
@@ -317,25 +378,34 @@ def show_plan(p: Plan):
 
 # ---- main
 
-def main():
-    ap = argparse.ArgumentParser(description="Approach-first issue resolver.")
-    ap.add_argument("repo", help="Path to the repo to work on.")
-    ap.add_argument("--issue", help="Issue text.")
-    ap.add_argument("--issue-file", help="File containing the issue text.")
-    ap.add_argument("--approach", type=int, help="Pick approach N after a triage fork.")
-    args = ap.parse_args()
+def resolve_repo_and_issue(args) -> tuple[Path, str, str | None]:
+    """Return (repo_root, issue_text, tmpdir_to_clean).
 
+    Remote mode (--issue-url): fetch the issue via gh and shallow-clone the
+    repo into a temp dir. Local mode: a repo path + --issue/--issue-file.
+    """
+    if args.issue_url:
+        owner, repo, number = parse_issue_url(args.issue_url)
+        print(f"Fetching {owner}/{repo}#{number}...", file=sys.stderr)
+        issue = fetch_issue_text(owner, repo, number)
+        tmpdir = tempfile.mkdtemp(prefix="scout-")
+        root = Path(tmpdir) / repo
+        print(f"Cloning {owner}/{repo} (shallow)...", file=sys.stderr)
+        clone_repo(owner, repo, str(root))
+        return root, issue, tmpdir
+    if not args.repo:
+        sys.exit("Provide a repo path with --issue/--issue-file, or use --issue-url.")
     root = Path(args.repo).expanduser().resolve()
     if not root.is_dir():
         sys.exit(f"Not a directory: {root}")
     if args.issue_file:
-        issue = Path(args.issue_file).read_text(encoding="utf-8")
-    elif args.issue:
-        issue = args.issue
-    else:
-        sys.exit("Provide --issue or --issue-file.")
-    client = make_client()
+        return root, Path(args.issue_file).read_text(encoding="utf-8"), None
+    if args.issue:
+        return root, args.issue, None
+    sys.exit("Provide --issue or --issue-file (or --issue-url).")
 
+
+def run(client, root: Path, issue: str, approach_n: int | None):
     print("Reading the codebase...", file=sys.stderr)
     context = gather_context(root, issue)
 
@@ -356,7 +426,7 @@ def main():
     aset = approaches(client, context, issue)
     show_approaches(aset)
 
-    n = args.approach
+    n = approach_n
     if n is None and sys.stdin.isatty():
         try:
             n = int(input(f"\nPick an approach [1-{len(aset.approaches)}]: ").strip())
@@ -372,6 +442,23 @@ def main():
     print(f"\nChosen: [{n}] {chosen.name}", file=sys.stderr)
     chosen_desc = f"{chosen.name}: {chosen.summary}\nTradeoff: {chosen.tradeoffs}\nFit: {chosen.codebase_fit}"
     show_plan(plan(client, context, issue, chosen_desc))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Approach-first issue resolver.")
+    ap.add_argument("repo", nargs="?", help="Path to a local repo to work on.")
+    ap.add_argument("--issue", help="Issue text (local mode).")
+    ap.add_argument("--issue-file", help="File containing the issue text (local mode).")
+    ap.add_argument("--issue-url", help="GitHub issue URL; fetches the issue and shallow-clones the repo.")
+    ap.add_argument("--approach", type=int, help="Pick approach N after a triage fork.")
+    args = ap.parse_args()
+
+    root, issue, tmpdir = resolve_repo_and_issue(args)
+    try:
+        run(make_client(), root, issue, args.approach)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

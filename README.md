@@ -28,6 +28,12 @@ approaches genuinely distinct with real tradeoffs?
 pip install -r requirements.txt
 export ANTHROPIC_API_KEY=...
 
+# Remote mode: point it straight at a GitHub issue. scout fetches the issue
+# (title/body/comments) and shallow-clones the repo into a temp dir.
+python3 scout.py --issue-url https://github.com/owner/repo/issues/123
+python3 scout.py --issue-url https://github.com/owner/repo/issues/123 --approach 2
+
+# Local mode: a repo path + the issue text.
 # straightforward issue → goes straight to a plan
 python3 scout.py ~/some/repo --issue "Crash when config file is missing; should default."
 
@@ -35,6 +41,14 @@ python3 scout.py ~/some/repo --issue "Crash when config file is missing; should 
 python3 scout.py ~/some/repo --issue "Add caching to the metrics endpoint."
 python3 scout.py ~/some/repo --issue "Add caching to the metrics endpoint." --approach 2
 ```
+
+Remote mode needs the [`gh`](https://cli.github.com) CLI authenticated
+(`gh auth status`). The shallow clone is deleted when scout exits.
+
+As a pre-filter over a queue of issues, the triage step is a far better signal
+than `age + comment-count + keyword` heuristics: it reads the actual code and
+issue thread and tells "fixable with a clear path" apart from "false premise,"
+"generated code — fix upstream," or "needs a real design decision first."
 
 `--approach N` skips the interactive prompt (use it in non-TTY contexts, or to
 re-run after seeing the fork).
