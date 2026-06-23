@@ -45,10 +45,31 @@ python3 scout.py ~/some/repo --issue "Add caching to the metrics endpoint." --ap
 Remote mode needs the [`gh`](https://cli.github.com) CLI authenticated
 (`gh auth status`). The shallow clone is deleted when scout exits.
 
-As a pre-filter over a queue of issues, the triage step is a far better signal
-than `age + comment-count + keyword` heuristics: it reads the actual code and
-issue thread and tells "fixable with a clear path" apart from "false premise,"
-"generated code — fix upstream," or "needs a real design decision first."
+### Scan mode — rank a repo's open-issue queue
+
+```sh
+python3 scout.py scan https://github.com/owner/repo --limit 10
+python3 scout.py scan https://github.com/owner/repo --limit 20 --model claude-haiku-4-5
+```
+
+`scan` clones the repo once, then triages N open issues concurrently into a
+structured verdict — `{fixable, confidence, effort, claimed, blocker_type}` —
+and ranks **fixable + unclaimed** to the top. It's a pre-filter to point a
+contributor (or an execution agent) at the issues worth working, and a far
+better signal than `age + comment-count + keyword` heuristics: it reads the
+actual code and issue thread and separates "fixable with a clear path" from
+`false_premise`, `generated_code` (fix upstream), `needs_design`,
+`needs_maintainer`, `out_of_scope`, and already-`claimed`.
+
+```text
+       #  verdict   conf  effort claim blocker          one-liner
+  #18283  ✓ GO      0.80  small  no                     Clear self-contained fix: wrap tool.execute ...
+  #18256  ✓ GO      0.72  medium no                     Concrete, well-localized bug in save-queue ...
+  #18347  · skip    0.72  large  yes   needs_design     Already assigned; broad design change ...
+```
+
+`--model` lets you run the bulk pre-filter on a cheaper model and reserve
+`claude-opus-4-8` (the default) for the deep `--issue-url` pass on a pick.
 
 `--approach N` skips the interactive prompt (use it in non-TTY contexts, or to
 re-run after seeing the fork).

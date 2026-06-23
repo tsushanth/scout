@@ -34,7 +34,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 try:
     import anthropic
@@ -101,6 +103,28 @@ class Plan(BaseModel):
     approach_recap: str = Field(description="One-paragraph statement of the chosen approach.")
     files: list[FileChange] = Field(description="The files the change touches, each as a black box.")
     risks: str = Field(description="What could go wrong / what the reviewer should poke at.")
+
+
+class ScanVerdict(BaseModel):
+    """A fast, structured pre-filter verdict for ranking an issue queue."""
+    fixable: bool = Field(
+        description="True if there's a clear, self-contained fix path a "
+        "contributor could land without a maintainer decision first."
+    )
+    confidence: float = Field(description="0.0-1.0 confidence in the fixable call.")
+    effort: Literal["small", "medium", "large"] = Field(
+        description="Rough size of the change: small (a few lines/one file), "
+        "medium (a few files), large (cross-cutting)."
+    )
+    claimed: bool = Field(
+        description="True if someone already appears to be working on it "
+        "(assignee, linked PR, or an 'I'll take this' comment)."
+    )
+    blocker_type: Literal[
+        "none", "needs_design", "false_premise", "generated_code",
+        "needs_maintainer", "too_vague", "out_of_scope", "already_fixed",
+    ] = Field(description="Why it's NOT cleanly fixable; 'none' when fixable.")
+    one_line: str = Field(description="One-line rationale for the verdict.")
 
 
 # ---- context gathering
@@ -297,9 +321,9 @@ SYSTEM = (
 )
 
 
-def parse(client, schema, instruction: str, context: str, issue: str):
+def parse(client, schema, instruction: str, context: str, issue: str, model: str = MODEL):
     return client.messages.parse(
-        model=MODEL,
+        model=model,
         max_tokens=16000,
         thinking={"type": "adaptive"},
         system=SYSTEM,
@@ -346,6 +370,20 @@ def plan(client, context, issue, chosen: str) -> Plan:
         "how it's tested), not line-by-line. Then state the risks a reviewer "
         f"should poke at.\n\n=== CHOSEN APPROACH ===\n{chosen}",
         context, issue,
+    )
+
+
+def scan_triage(client, context, issue, model: str = MODEL) -> ScanVerdict:
+    return parse(
+        client, ScanVerdict,
+        "You are pre-filtering an issue queue to find good contribution "
+        "targets. Give a fast structured verdict: is there a clear, "
+        "self-contained fix path a contributor could land WITHOUT a maintainer "
+        "decision first? Read the actual code context before deciding. Mark "
+        "fixable=false (with the right blocker_type) for false premises, "
+        "auto-generated code that must change upstream, vague reports, design "
+        "questions, or things already fixed. Detect if it's already claimed.",
+        context, issue, model=model,
     )
 
 
@@ -461,5 +499,117 @@ def main():
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ---- scan: triage a repo's open-issue queue
+
+REPO_URL_RE = re.compile(r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git|/)?$")
+EFFORT_RANK = {"small": 0, "medium": 1, "large": 2}
+
+
+def parse_repo_url(url: str) -> tuple[str, str]:
+    m = REPO_URL_RE.match(url.strip())
+    if not m:
+        sys.exit(f"Not a github repo URL (need .../owner/repo): {url}")
+    return m.group(1), m.group(2)
+
+
+def list_open_issues(owner: str, repo: str, limit: int) -> list[dict]:
+    try:
+        out = subprocess.check_output(
+            ["gh", "issue", "list", "--repo", f"{owner}/{repo}", "--state", "open",
+             "--limit", str(limit), "--json", "number,title,body,url,labels,assignees"],
+            text=True, stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"gh issue list failed: {e.stderr.strip() or e}")
+    return json.loads(out)
+
+
+def issue_blob(it: dict) -> str:
+    labels = ", ".join(l.get("name", "") for l in it.get("labels", []))
+    assignees = ", ".join(a.get("login", "") for a in it.get("assignees", [])) or "(none)"
+    body = (it.get("body") or "(no body)")[:4000]
+    return (f"TITLE: {it.get('title','')}\nLABELS: {labels}\n"
+            f"ASSIGNEES: {assignees}\n\n{body}")
+
+
+def scan_issues(client, root: Path, issues: list[dict], model: str, workers: int) -> list[dict]:
+    def one(it: dict) -> dict:
+        blob = issue_blob(it)
+        try:
+            ctx = gather_context(root, blob)
+            v = scan_triage(client, ctx, blob, model=model)
+            # gh assignees are a hard claim signal; OR them with the model's read.
+            claimed = bool(it.get("assignees")) or v.claimed
+            return {"issue": it, "verdict": v, "claimed": claimed, "error": None}
+        except Exception as e:
+            return {"issue": it, "verdict": None, "claimed": bool(it.get("assignees")),
+                    "error": f"{type(e).__name__}: {e}"}
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(one, issues))
+
+    def key(r):
+        v = r["verdict"]
+        if v is None:
+            return (2, 0.0, 9)
+        good = v.fixable and not r["claimed"]
+        return (0 if good else 1, -v.confidence, EFFORT_RANK.get(v.effort, 1))
+
+    results.sort(key=key)
+    return results
+
+
+def print_scan_table(owner: str, repo: str, results: list[dict]):
+    print(hr(f"SCAN — {owner}/{repo} — {len(results)} open issues, ranked by fixable + unclaimed"))
+    print(f"\n  {'#':>6}  {'verdict':<9} {'conf':>4}  {'effort':<6} {'claim':<5} {'blocker':<16} one-liner")
+    print("  " + "─" * 110)
+    for r in results:
+        it, v = r["issue"], r["verdict"]
+        num = f"#{it['number']}"
+        if v is None:
+            print(f"  {num:>6}  {'ERROR':<9} {'-':>4}  {'-':<6} {'-':<5} {'-':<16} {r['error']}")
+            continue
+        mark = "✓ GO" if (v.fixable and not r["claimed"]) else "· skip"
+        claim = "yes" if r["claimed"] else "no"
+        blk = "" if v.blocker_type == "none" else v.blocker_type
+        print(f"  {num:>6}  {mark:<9} {v.confidence:>4.2f}  {v.effort:<6} {claim:<5} {blk:<16} {v.one_line[:80]}")
+    print("\n  Top picks (✓ GO):")
+    gos = [r for r in results if r["verdict"] and r["verdict"].fixable and not r["claimed"]]
+    for r in gos[:5]:
+        print(f"    {r['issue']['url']}")
+    if not gos:
+        print("    (none — nothing cleanly fixable + unclaimed in this batch)")
+
+
+def scan_main(argv):
+    ap = argparse.ArgumentParser(prog="scout scan",
+                                 description="Triage a repo's open issues into a fixable-issue queue.")
+    ap.add_argument("repo_url", help="GitHub repo URL, e.g. https://github.com/owner/repo")
+    ap.add_argument("--limit", type=int, default=10, help="How many open issues to scan (default 10).")
+    ap.add_argument("--model", default=MODEL, help=f"Model for the scan verdict (default {MODEL}).")
+    ap.add_argument("--workers", type=int, default=5, help="Concurrent triage calls (default 5).")
+    args = ap.parse_args(argv)
+
+    owner, repo = parse_repo_url(args.repo_url)
+    print(f"Listing up to {args.limit} open issues in {owner}/{repo}...", file=sys.stderr)
+    issues = list_open_issues(owner, repo, args.limit)
+    if not issues:
+        print("No open issues found.")
+        return
+    tmpdir = tempfile.mkdtemp(prefix="scout-")
+    root = Path(tmpdir) / repo
+    print(f"Cloning {owner}/{repo} (shallow)...", file=sys.stderr)
+    clone_repo(owner, repo, str(root))
+    try:
+        print(f"Triaging {len(issues)} issues ({args.workers} at a time)...", file=sys.stderr)
+        results = scan_issues(make_client(), root, issues, args.model, args.workers)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print_scan_table(owner, repo, results)
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "scan":
+        scan_main(sys.argv[2:])
+    else:
+        main()
