@@ -443,7 +443,7 @@ def resolve_repo_and_issue(args) -> tuple[Path, str, str | None]:
     sys.exit("Provide --issue or --issue-file (or --issue-url).")
 
 
-def run(client, root: Path, issue: str, approach_n: int | None):
+def run(client, root: Path, issue: str, approach_n: int | None) -> Plan | None:
     print("Reading the codebase...", file=sys.stderr)
     context = gather_context(root, issue)
 
@@ -457,8 +457,9 @@ def run(client, root: Path, issue: str, approach_n: int | None):
     if not t.needs_approach_choice:
         print(f"\nOne obvious approach: {t.single_approach_summary}")
         print("\nProceeding straight to the plan (no approach fork needed).", file=sys.stderr)
-        show_plan(plan(client, context, issue, t.single_approach_summary))
-        return
+        p = plan(client, context, issue, t.single_approach_summary)
+        show_plan(p)
+        return p
 
     print("Generating distinct approaches...", file=sys.stderr)
     aset = approaches(client, context, issue)
@@ -472,14 +473,80 @@ def run(client, root: Path, issue: str, approach_n: int | None):
             n = None
     if n is None:
         print(f"\nRe-run with --approach N (1-{len(aset.approaches)}) to get the plan for one.")
-        return
+        return None
     if not (1 <= n <= len(aset.approaches)):
         sys.exit(f"--approach must be 1..{len(aset.approaches)}")
 
     chosen = aset.approaches[n - 1]
     print(f"\nChosen: [{n}] {chosen.name}", file=sys.stderr)
     chosen_desc = f"{chosen.name}: {chosen.summary}\nTradeoff: {chosen.tradeoffs}\nFit: {chosen.codebase_fit}"
-    show_plan(plan(client, context, issue, chosen_desc))
+    p = plan(client, context, issue, chosen_desc)
+    show_plan(p)
+    return p
+
+
+# ---- execute: hand the plan to Claude Code to write the change (stop before PR)
+
+def render_plan_md(issue_url: str, p: Plan) -> str:
+    lines = [
+        f"# Implement the fix for {issue_url}",
+        "",
+        "You are in a clone of the target repo on a fresh branch. Implement the "
+        "plan below: edit the files, and run the project's tests if you can.",
+        "",
+        "Hard rules:",
+        "- Do NOT push, do NOT open a pull request, do NOT run `gh` or `git push`.",
+        "- Do NOT add any AI/Claude/agent attribution to commits or anywhere else.",
+        "- Stay within the scope of the plan; don't refactor unrelated code.",
+        "- If something in the plan is wrong given the actual code, do the right "
+        "thing and note it in your final summary.",
+        "",
+        "## Approach",
+        "",
+        p.approach_recap,
+        "",
+        "## Files to change",
+        "",
+    ]
+    for fc in p.files:
+        lines += [f"### {fc.path}", f"- What: {fc.what_it_does}", f"- Testing: {fc.how_tested}", ""]
+    lines += ["## Risks to respect", "", p.risks, ""]
+    return "\n".join(lines)
+
+
+def execute_plan(root: Path, issue_url: str, p: Plan) -> None:
+    executor = os.environ.get("SCOUT_EXECUTOR", "claude")
+    if not shutil.which(executor):
+        sys.exit(f"executor '{executor}' not found on PATH "
+                 f"(install Claude Code, or set SCOUT_EXECUTOR).")
+    _, _, number = parse_issue_url(issue_url)
+    branch = f"scout/issue-{number}"
+    git = ["git", "-C", str(root)]
+    base = subprocess.check_output([*git, "rev-parse", "HEAD"], text=True).strip()
+    subprocess.run([*git, "checkout", "-q", "-B", branch], check=True)
+
+    plan_md = render_plan_md(issue_url, p)
+    (root.parent / "plan.md").write_text(plan_md)  # reference copy, outside the work tree
+
+    print(hr(f"EXECUTING via '{executor}' (non-interactive) on branch {branch}"))
+    print("Handing the plan to the executor; it edits + tests autonomously...\n", file=sys.stderr)
+    sys.stdout.flush()  # keep our headers ahead of the subprocess's own output
+    subprocess.run([executor, "--print", plan_md, "--allowedTools", "Edit,Write,Bash"], cwd=str(root))
+
+    subprocess.run([*git, "add", "-A"])
+    print(hr("DIFF (all changes vs. clone base)"))
+    sys.stdout.flush()
+    subprocess.run([*git, "--no-pager", "diff", "--cached", base])
+    commits = subprocess.check_output([*git, "log", "--oneline", f"{base}..HEAD"], text=True).strip()
+
+    print(hr("REVIEW — nothing has been pushed"))
+    if commits:
+        print("commits made on the branch:\n" + commits + "\n")
+    print("Review the diff above. If it's good, push it yourself (open the PR by "
+          "hand so your pre-flight rules apply — closedByPullRequestsReferences, "
+          "parallel PRs, repo-specific base branch, no AI attribution):")
+    print(f"  cd {root}")
+    print(f"  git push <your-fork-remote> {branch}")
 
 
 def main():
@@ -489,14 +556,31 @@ def main():
     ap.add_argument("--issue-file", help="File containing the issue text (local mode).")
     ap.add_argument("--issue-url", help="GitHub issue URL; fetches the issue and shallow-clones the repo.")
     ap.add_argument("--approach", type=int, help="Pick approach N after a triage fork.")
+    ap.add_argument("--execute", action="store_true",
+                    help="After the plan, hand it to Claude Code to write the change (stops before PR). Requires --issue-url.")
+    ap.add_argument("--no-keep", action="store_true",
+                    help="With --execute, delete the clone on exit instead of keeping it for you to push.")
     args = ap.parse_args()
 
+    if args.execute and not args.issue_url:
+        sys.exit("--execute requires --issue-url (it works on a throwaway clone, not your local repo).")
+
     root, issue, tmpdir = resolve_repo_and_issue(args)
+    keep = False
     try:
-        run(make_client(), root, issue, args.approach)
+        p = run(make_client(), root, issue, args.approach)
+        if args.execute:
+            if p is None:
+                print("\nNo plan to execute — the triage forked. Re-run with "
+                      "--approach N --execute.", file=sys.stderr)
+            else:
+                execute_plan(root, args.issue_url, p)
+                keep = not args.no_keep
     finally:
-        if tmpdir:
+        if tmpdir and not keep:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        elif tmpdir and keep:
+            print(f"\nClone kept at {root} (re-run with --no-keep to auto-delete).", file=sys.stderr)
 
 
 # ---- scan: triage a repo's open-issue queue

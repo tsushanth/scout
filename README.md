@@ -71,6 +71,26 @@ actual code and issue thread and separates "fixable with a clear path" from
 `--model` lets you run the bulk pre-filter on a cheaper model and reserve
 `claude-opus-4-8` (the default) for the deep `--issue-url` pass on a pick.
 
+### Execute mode — hand the plan to Claude Code (stops before PR)
+
+```sh
+python3 scout.py --issue-url https://github.com/owner/repo/issues/123 --execute
+# triage -> [approach] -> plan -> claude --print writes the change -> diff
+```
+
+With `--execute`, after the plan scout creates a `scout/issue-N` branch in the
+clone and runs `claude --print` inside it (`--allowedTools Edit,Write,Bash`) to
+implement the change and run tests, then stages everything and prints the diff.
+**It stops there — nothing is pushed and no PR is opened.** scout writes and
+stages the code; you review the diff, then push to your fork and open the PR by
+hand, where your pre-flight rules apply (existing/parallel PRs, the repo's base
+branch, no AI attribution). The clone is kept so you can `cd` in and push
+(`--no-keep` deletes it instead).
+
+`--execute` requires `--issue-url` (it works on a throwaway clone, never your
+local repo). The executor is `claude` by default; override with
+`SCOUT_EXECUTOR`.
+
 `--approach N` skips the interactive prompt (use it in non-TTY contexts, or to
 re-run after seeing the fork).
 
