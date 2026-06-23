@@ -692,8 +692,137 @@ def scan_main(argv):
     print_scan_table(owner, repo, results)
 
 
+# ---- sweep: run scout scan across a curated list of repos
+
+DEFAULT_REPOS = [
+    # repos with open PRs / warm maintainers
+    "https://github.com/drizzle-team/drizzle-orm",
+    "https://github.com/mastra-ai/mastra",
+    "https://github.com/livekit/agents-js",
+    "https://github.com/livekit/agents",
+    "https://github.com/supabase/auth",
+    "https://github.com/TanStack/db",
+    "https://github.com/TanStack/query",
+    "https://github.com/PostHog/posthog",
+    "https://github.com/PostHog/posthog-js",
+    "https://github.com/storybookjs/storybook",
+    "https://github.com/expo/expo",
+    "https://github.com/better-auth/better-auth",
+    "https://github.com/liveblocks/liveblocks",
+    "https://github.com/vercel/turborepo",
+    "https://github.com/vercel/ai",
+    "https://github.com/vercel/next.js",
+    "https://github.com/inngest/inngest",
+    "https://github.com/BerriAI/litellm",
+    # fresh orgs
+    "https://github.com/solidjs/solid",
+    "https://github.com/solidjs/solid-start",
+    "https://github.com/pinecone-io/pinecone-ts-client",
+    "https://github.com/pinecone-io/pinecone-python-client",
+    "https://github.com/getsentry/sentry-cocoa",
+    "https://github.com/getsentry/sentry-java",
+    "https://github.com/convex-dev/convex-js",
+    "https://github.com/outline/outline",
+    "https://github.com/unjs/nf3",
+    "https://github.com/unjs/consola",
+    "https://github.com/prisma/prisma",
+    "https://github.com/cloudflare/workers-sdk",
+    "https://github.com/langchain-ai/langchain",
+    "https://github.com/RevenueCat/purchases-ios",
+    "https://github.com/RevenueCat/purchases-android",
+]
+
+
+def sweep_one(args_tuple) -> list[dict]:
+    """Scan one repo; return list of GO results. Runs in a thread."""
+    repo_url, limit, model, workers, client = args_tuple
+    owner, repo = parse_repo_url(repo_url)
+    print(f"  scanning {owner}/{repo}...", file=sys.stderr)
+    try:
+        issues = list_open_issues(owner, repo, limit)
+    except SystemExit:
+        print(f"  ! {owner}/{repo} — gh list failed, skipping", file=sys.stderr)
+        return []
+    if not issues:
+        return []
+    tmpdir = tempfile.mkdtemp(prefix="scout-")
+    root = Path(tmpdir) / repo
+    try:
+        clone_repo(owner, repo, str(root))
+    except SystemExit:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        print(f"  ! {owner}/{repo} — clone failed, skipping", file=sys.stderr)
+        return []
+    try:
+        results = scan_issues(client, root, issues, model, workers)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    gos = [r for r in results if r["verdict"] and r["verdict"].fixable and not r["claimed"]]
+    for r in gos:
+        r["repo_url"] = repo_url
+        r["owner"] = owner
+        r["repo"] = repo
+    return gos
+
+
+def sweep_main(argv):
+    ap = argparse.ArgumentParser(prog="scout sweep",
+                                 description="Run scout scan across multiple repos and rank all GOs together.")
+    ap.add_argument("repos", nargs="*",
+                    help="GitHub repo URLs to sweep. Omit to use the built-in curated list.")
+    ap.add_argument("--limit", type=int, default=15,
+                    help="Open issues to scan per repo (default 15).")
+    ap.add_argument("--model", default="claude-haiku-4-5-20251001",
+                    help="Model for scan verdicts (default haiku — cheap for bulk).")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="Concurrent triage calls per repo (default 4).")
+    ap.add_argument("--repo-workers", type=int, default=3,
+                    help="Repos to clone+scan concurrently (default 3).")
+    ap.add_argument("--save", default="/tmp/sweep_candidates.json",
+                    help="Where to save GO results (default /tmp/sweep_candidates.json).")
+    args = ap.parse_args(argv)
+
+    repos = args.repos or DEFAULT_REPOS
+    client = make_client()
+    print(f"Sweeping {len(repos)} repos ({args.limit} issues each, model={args.model})...",
+          file=sys.stderr)
+
+    sweep_args = [(url, args.limit, args.model, args.workers, client) for url in repos]
+    all_gos: list[dict] = []
+    with ThreadPoolExecutor(max_workers=args.repo_workers) as ex:
+        for gos in ex.map(sweep_one, sweep_args):
+            all_gos.extend(gos)
+
+    # rank: confidence desc, effort asc
+    all_gos.sort(key=lambda r: (-r["verdict"].confidence, EFFORT_RANK.get(r["verdict"].effort, 1)))
+
+    print(hr(f"SWEEP — {len(repos)} repos — {len(all_gos)} GO candidates"))
+    print(f"\n  {'REPO':<35} {'#':>6}  {'conf':>4}  {'effort':<6} one-liner")
+    print("  " + "─" * 110)
+    for r in all_gos[:30]:
+        it, v = r["issue"], r["verdict"]
+        repo_short = f"{r['owner']}/{r['repo']}"
+        print(f"  {repo_short:<35} #{it['number']:<6}  {v.confidence:>4.2f}  {v.effort:<6} {v.one_line[:70]}")
+    print(f"\n  URLs for top picks:")
+    for r in all_gos[:10]:
+        print(f"    {r['issue']['url']}")
+
+    with open(args.save, "w") as f:
+        json.dump([{
+            "repo": r["repo_url"], "owner": r["owner"],
+            "number": r["issue"]["number"], "url": r["issue"]["url"],
+            "title": r["issue"].get("title",""),
+            "confidence": r["verdict"].confidence,
+            "effort": r["verdict"].effort,
+            "one_line": r["verdict"].one_line,
+        } for r in all_gos], f, indent=2)
+    print(f"\n  Saved {len(all_gos)} GOs to {args.save}", file=sys.stderr)
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "scan":
         scan_main(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "sweep":
+        sweep_main(sys.argv[2:])
     else:
         main()
