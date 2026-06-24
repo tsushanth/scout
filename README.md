@@ -98,12 +98,15 @@ re-run after seeing the fork).
 
 scout uses, in order:
 
-1. `ANTHROPIC_API_KEY` if set — a standard inference key. Best for any real use.
-2. On macOS, the **Claude Code OAuth token** from the keychain as a fallback —
-   your personal Claude subscription credential. Convenient for local testing
-   (no key to manage), but it shares a rate-limit pool with any live Claude Code
-   session, so it can 429 under contention. Use a real key for anything
-   sustained.
+1. `ANTHROPIC_API_KEY` if set — a standard inference key.
+2. Otherwise, on macOS, the **Claude Code subscription** (OAuth token from the
+   keychain) — no key to manage.
+
+Pass `--subscription` (or set `SCOUT_SUBSCRIPTION=1`) to force the subscription
+and **never use an API key even if one is set** — so the planning calls run on
+the same Claude Code subscription as the `--execute` step. The subscription
+shares a rate-limit pool with any live Claude Code session, so run it when
+nothing else is competing, and drop `scan --workers` if you hit 429s.
 
 ## Why it's not just another issue→PR bot
 

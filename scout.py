@@ -296,19 +296,27 @@ def claude_code_oauth_token() -> str | None:
         return None
 
 
-def make_client() -> "anthropic.Anthropic":
-    """Prefer ANTHROPIC_API_KEY; fall back to the Claude Code OAuth token."""
-    if os.environ.get("ANTHROPIC_API_KEY"):
+def make_client(force_subscription: bool = False) -> "anthropic.Anthropic":
+    """Credential resolution.
+
+    Default: use ANTHROPIC_API_KEY if set, else the Claude Code subscription
+    (OAuth token from the keychain). With --subscription / SCOUT_SUBSCRIPTION=1,
+    always use the subscription and never touch an API key — so scout's planning
+    calls run on the same Claude Code subscription as the `--execute` step.
+    """
+    force = force_subscription or os.environ.get("SCOUT_SUBSCRIPTION") in ("1", "true", "yes")
+    if os.environ.get("ANTHROPIC_API_KEY") and not force:
         return anthropic.Anthropic(max_retries=4)
     tok = claude_code_oauth_token()
     if tok:
-        print("No ANTHROPIC_API_KEY — using Claude Code OAuth token "
-              "(shared rate-limit pool; may throttle).", file=sys.stderr)
+        print("Using your Claude Code subscription (no API key).", file=sys.stderr)
         return anthropic.Anthropic(
             auth_token=tok,
             default_headers={"anthropic-beta": "oauth-2025-04-20"},
             max_retries=4,
         )
+    if force:
+        sys.exit("--subscription set but no Claude Code token found — sign in to Claude Code.")
     sys.exit("No credential: set ANTHROPIC_API_KEY or sign in to Claude Code.")
 
 
@@ -565,6 +573,8 @@ def main():
                     help="After the plan, hand it to Claude Code to write the change (stops before PR). Requires --issue-url.")
     ap.add_argument("--no-keep", action="store_true",
                     help="With --execute, delete the clone on exit instead of keeping it for you to push.")
+    ap.add_argument("--subscription", action="store_true",
+                    help="Use your Claude Code subscription for the planning calls too (never an API key).")
     args = ap.parse_args()
 
     if args.execute and not args.issue_url:
@@ -573,7 +583,7 @@ def main():
     root, issue, tmpdir = resolve_repo_and_issue(args)
     keep = False
     try:
-        p = run(make_client(), root, issue, args.approach)
+        p = run(make_client(args.subscription), root, issue, args.approach)
         if args.execute:
             if p is None:
                 print("\nNo plan to execute — the triage forked. Re-run with "
@@ -677,6 +687,8 @@ def scan_main(argv):
     ap.add_argument("--limit", type=int, default=10, help="How many open issues to scan (default 10).")
     ap.add_argument("--model", default=MODEL, help=f"Model for the scan verdict (default {MODEL}).")
     ap.add_argument("--workers", type=int, default=5, help="Concurrent triage calls (default 5).")
+    ap.add_argument("--subscription", action="store_true",
+                    help="Use your Claude Code subscription instead of an API key.")
     args = ap.parse_args(argv)
 
     owner, repo = parse_repo_url(args.repo_url)
@@ -691,7 +703,7 @@ def scan_main(argv):
     clone_repo(owner, repo, str(root))
     try:
         print(f"Triaging {len(issues)} issues ({args.workers} at a time)...", file=sys.stderr)
-        results = scan_issues(make_client(), root, issues, args.model, args.workers)
+        results = scan_issues(make_client(args.subscription), root, issues, args.model, args.workers)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
     print_scan_table(owner, repo, results)
@@ -785,10 +797,12 @@ def sweep_main(argv):
                     help="Repos to clone+scan concurrently (default 3).")
     ap.add_argument("--save", default="/tmp/sweep_candidates.json",
                     help="Where to save GO results (default /tmp/sweep_candidates.json).")
+    ap.add_argument("--subscription", action="store_true",
+                    help="Use your Claude Code subscription instead of an API key.")
     args = ap.parse_args(argv)
 
     repos = args.repos or DEFAULT_REPOS
-    client = make_client()
+    client = make_client(args.subscription)
     print(f"Sweeping {len(repos)} repos ({args.limit} issues each, model={args.model})...",
           file=sys.stderr)
 
