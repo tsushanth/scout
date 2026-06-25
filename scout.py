@@ -60,7 +60,8 @@ CODE_EXTS = {
 MAX_TREE_ENTRIES = 400
 MAX_RELEVANT_FILES = 8
 MAX_FILE_CHARS = 6000
-DIGEST_FILE_CHARS = 16000  # deeper per-file cap for the whole-repo `find` audit
+DIGEST_FILE_CHARS = 16000   # deeper per-file cap for the whole-repo `find` audit
+DIGEST_TOTAL_CHARS = 200000  # cap the whole digest so one request can't blow the rate limit
 
 
 # ---- structured-output schemas (validated by the SDK; the model retries on mismatch)
@@ -926,10 +927,19 @@ def repo_digest(root: Path, max_files: int) -> tuple[str, list[str]]:
             parts += ["## README\n", read_capped(rp), "\n"]
             break
     files = digest_files(root, max_files)
-    parts.append(f"\n## Source files ({len(files)} sampled for audit)\n")
+    total = sum(len(s) for s in parts)
+    included: list[str] = []
+    body: list[str] = []
     for rel, p in files:
-        parts += [f"\n### {rel}\n```\n", read_capped(p, DIGEST_FILE_CHARS), "\n```\n"]
-    return "".join(parts), [rel for rel, _ in files]
+        chunk = read_capped(p, DIGEST_FILE_CHARS)
+        if included and total + len(chunk) > DIGEST_TOTAL_CHARS:
+            break  # keep the whole digest under the rate-limit-safe budget
+        body += [f"\n### {rel}\n```\n", chunk, "\n```\n"]
+        total += len(chunk) + len(rel) + 12
+        included.append(rel)
+    parts.append(f"\n## Source files ({len(included)} sampled for audit)\n")
+    parts += body
+    return "".join(parts), included
 
 
 def audit_call(client, schema, instruction: str, context: str, model: str):
@@ -985,12 +995,17 @@ def verify(client, root: Path, f: Finding, model: str) -> Verdict:
 
 
 def dedup_findings(findings: list[Finding]) -> list[Finding]:
-    seen, out = set(), []
+    # Two lenses often surface the same issue with slightly different titles, so
+    # also dedup on the proposed fix (identical fix in the same file == same issue).
+    seen_title, seen_fix, out = set(), set(), []
     for f in findings:
-        k = (f.file.lower(), f.title.lower()[:50])
-        if k not in seen:
-            seen.add(k)
-            out.append(f)
+        kt = (f.file.lower(), f.title.lower()[:50])
+        kf = (f.file.lower(), " ".join(f.proposed_change.lower().split())[:60])
+        if kt in seen_title or kf in seen_fix:
+            continue
+        seen_title.add(kt)
+        seen_fix.add(kf)
+        out.append(f)
     return out
 
 
@@ -1106,7 +1121,7 @@ def find_main(argv):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-if __name__ == "__main__":
+def _dispatch():
     sub = sys.argv[1] if len(sys.argv) > 1 else None
     if sub == "scan":
         scan_main(sys.argv[2:])
@@ -1116,3 +1131,14 @@ if __name__ == "__main__":
         find_main(sys.argv[2:])
     else:
         main()
+
+
+if __name__ == "__main__":
+    try:
+        _dispatch()
+    except anthropic.RateLimitError:
+        sys.exit("\nRate limited (429). On --subscription this is the shared Claude "
+                 "Code pool — close other Claude Code sessions and retry, or drop "
+                 "--subscription to use ANTHROPIC_API_KEY.")
+    except KeyboardInterrupt:
+        sys.exit(130)
