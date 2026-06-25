@@ -117,6 +117,17 @@ sampled into the digest), `--workers N` (concurrent verification), `--model`,
 `--subscription`. Large files are sampled, not read whole — per-file chunking is
 the next step for very large modules.
 
+Add `--html` to also emit a self-contained interactive **artifact** —
+`OVERVIEW.html`: the code map plus severity-color-coded finding cards with
+filter chips (high/medium/low, bug/health), confidence bars, and `file:line`
+links straight to GitHub. One file, no server, no deps — open it in a browser.
+It's templated from scout's structured output (deterministic, free, identical
+every run), not LLM-generated.
+
+```sh
+python3 scout.py find https://github.com/owner/repo --html
+```
+
 `--approach N` skips the interactive prompt (use it in non-TTY contexts, or to
 re-run after seeing the fork).
 

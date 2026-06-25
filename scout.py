@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -1049,6 +1050,117 @@ def write_overview(path: Path, root: Path, rmap: RepoMap, sampled: list[str],
     path.write_text("\n".join(L), encoding="utf-8")
 
 
+SEV_HEX = {"high": "#c0392b", "medium": "#b9770e", "low": "#6b7280"}
+
+
+def render_overview_html(repo_name: str, base_url: str | None, rmap: RepoMap,
+                         sampled: list[str], confirmed: list[tuple[Finding, Verdict]],
+                         n_candidates: int) -> str:
+    """A self-contained, interactive HTML 'artifact' of the audit (no server/deps)."""
+    e = html.escape
+
+    def flink(path: str) -> str:
+        p = e(path)
+        if base_url:
+            return f'<a href="{base_url}/blob/HEAD/{p}" target="_blank" rel="noopener"><code>{p}</code></a>'
+        return f"<code>{p}</code>"
+
+    counts = {"high": 0, "medium": 0, "low": 0}
+    for _, v in confirmed:
+        counts[v.severity] = counts.get(v.severity, 0) + 1
+
+    cards = []
+    for f, v in confirmed:
+        col = SEV_HEX.get(v.severity, "#6b7280")
+        pct = int(round(v.confidence * 100))
+        cards.append(f"""
+    <div class="card" data-sev="{e(v.severity)}" data-cat="{e(f.category)}">
+      <div class="ch">
+        <span class="pill" style="background:{col}">{e(v.severity.upper())}</span>
+        <span class="ct">{e(f.title)}</span>
+        <span class="tag">{e(f.category)}/{e(f.kind)}</span>
+      </div>
+      <div class="meta">{flink(f.file)} &middot; {e(f.locator)}</div>
+      <div class="why">{e(v.rationale)}</div>
+      <div class="fix"><b>fix</b> {e(v.proposed_change)}</div>
+      <div class="bar"><i style="width:{pct}%;background:{col}"></i></div>
+      <div class="cn">confidence {pct}%</div>
+    </div>""")
+
+    areas = []
+    for a in rmap.areas:
+        kf = " ".join(flink(x) for x in a.key_files) or "<span class=dim>—</span>"
+        areas.append(f"<details><summary><b>{e(a.name)}</b> — {e(a.does)}</summary>"
+                     f"<div class=kf>{kf}</div></details>")
+
+    chip = lambda key, label: f'<button class="chip on" data-f="{key}">{label}</button>'
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>scout · {e(repo_name)}</title>
+<style>
+:root{{--bg:#fafafa;--card:#fff;--line:#e5e7eb;--ink:#1f2937;--dim:#6b7280}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
+.wrap{{max-width:860px;margin:0 auto;padding:32px 20px 80px}}
+h1{{font-size:22px;margin:0 0 4px}}
+.sub{{color:var(--dim);margin:0 0 18px;font-size:13px}}
+.summary{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:0 0 24px}}
+h2{{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:28px 0 12px}}
+details{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:0 0 8px}}
+summary{{cursor:pointer}} .kf{{margin-top:8px;font-size:13px;color:var(--dim)}}
+code{{background:#f1f3f5;border-radius:4px;padding:1px 5px;font-size:12.5px}}
+a code{{background:#eef2ff;color:#3730a3}}
+.bars{{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}}
+.chip{{border:1px solid var(--line);background:var(--card);border-radius:999px;padding:5px 12px;font-size:13px;cursor:pointer;color:var(--dim)}}
+.chip.on{{background:var(--ink);color:#fff;border-color:var(--ink)}}
+.card{{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:8px;padding:14px 16px;margin:0 0 12px}}
+.card[data-sev=high]{{border-left-color:#c0392b}} .card[data-sev=medium]{{border-left-color:#b9770e}} .card[data-sev=low]{{border-left-color:#6b7280}}
+.ch{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+.pill{{color:#fff;font-size:11px;font-weight:700;border-radius:5px;padding:2px 7px;letter-spacing:.03em}}
+.ct{{font-weight:600;flex:1;min-width:200px}}
+.tag{{font-size:12px;color:var(--dim);background:#f1f3f5;border-radius:5px;padding:2px 7px}}
+.meta{{font-size:13px;color:var(--dim);margin:8px 0}}
+.why{{margin:8px 0;font-size:14px}}
+.fix{{font-size:13.5px;background:#f6f8fa;border-radius:6px;padding:8px 10px;margin:8px 0}}
+.fix b{{color:#15803d;margin-right:6px}}
+.bar{{height:5px;background:#eef0f2;border-radius:3px;overflow:hidden}} .bar i{{display:block;height:100%}}
+.cn{{font-size:11px;color:var(--dim);margin-top:4px}}
+.dim{{color:var(--dim)}} footer{{color:var(--dim);font-size:12px;margin-top:32px}}
+.hidden{{display:none}}
+</style></head><body><div class=wrap>
+<h1>{e(repo_name)}</h1>
+<p class=sub>scout audit &middot; {len(confirmed)} verified findings (of {n_candidates} candidates) &middot;
+{counts['high']} high &middot; {counts['medium']} medium &middot; {counts['low']} low &middot;
+{len(sampled)} files sampled</p>
+<div class=summary>{e(rmap.summary)}</div>
+<h2>Map</h2>
+{''.join(areas)}
+<h2>Test shape</h2>
+<div class=summary>{e(rmap.test_shape)}</div>
+<h2>Findings</h2>
+<div class=bars>
+{chip('all','All')}{chip('high','High')}{chip('medium','Medium')}{chip('low','Low')}
+{chip('bug','Bugs')}{chip('health','Health')}
+</div>
+{''.join(cards) or '<p class=dim>No findings survived verification.</p>'}
+<footer>Generated by <code>scout find</code>. Findings are LLM-discovered, adversarially verified — still candidates; confirm before acting. Sample, not exhaustive.</footer>
+</div>
+<script>
+const cards=[...document.querySelectorAll('.card')];
+let sev='all', cat='all';
+function apply(){{cards.forEach(c=>{{const s=(sev==='all'||c.dataset.sev===sev),k=(cat==='all'||c.dataset.cat===cat);c.classList.toggle('hidden',!(s&&k));}});}}
+document.querySelectorAll('.chip').forEach(b=>b.onclick=()=>{{
+  const f=b.dataset.f;
+  if(f==='all'){{sev='all';cat='all';}}
+  else if(f==='bug'||f==='health'){{cat=(cat===f?'all':f);}}
+  else {{sev=(sev===f?'all':f);}}
+  document.querySelectorAll('.chip').forEach(x=>{{const xf=x.dataset.f;
+    x.classList.toggle('on', xf==='all'?(sev==='all'&&cat==='all'):(xf===sev||xf===cat));}});
+  apply();
+}});
+</script></body></html>"""
+
+
 def print_find_summary(confirmed: list[tuple[Finding, Verdict]]):
     print(hr(f"VERIFIED FINDINGS — {len(confirmed)}"))
     for f, v in confirmed:
@@ -1066,6 +1178,8 @@ def find_main(argv):
     ap.add_argument("--per-lens", type=int, default=8, help="Max candidate findings per lens.")
     ap.add_argument("--workers", type=int, default=5, help="Concurrent verification calls.")
     ap.add_argument("--out", default="OVERVIEW.md", help="Artifact filename written into a local repo.")
+    ap.add_argument("--html", action="store_true",
+                    help="Also emit a self-contained interactive OVERVIEW.html artifact.")
     ap.add_argument("--subscription", action="store_true",
                     help="Use your Claude Code subscription instead of an API key.")
     args = ap.parse_args(argv)
@@ -1078,11 +1192,13 @@ def find_main(argv):
         print(f"Cloning {owner}/{repo} (shallow)...", file=sys.stderr)
         clone_repo(owner, repo, str(root))
         out_path = Path.cwd() / f"OVERVIEW-{repo}.md"  # survives clone cleanup
+        base_url = f"https://github.com/{owner}/{repo}"
     else:
         root = Path(args.repo).expanduser().resolve()
         if not root.is_dir():
             sys.exit(f"Not a directory: {root}")
         out_path = root / args.out
+        base_url = None
 
     client = make_client(args.subscription)
     try:
@@ -1115,6 +1231,12 @@ def find_main(argv):
 
         write_overview(out_path, root, rmap, sampled, confirmed, len(cands))
         print(f"\nWrote {out_path}")
+        if args.html:
+            html_path = out_path.with_suffix(".html")
+            html_path.write_text(
+                render_overview_html(root.name, base_url, rmap, sampled, confirmed, len(cands)),
+                encoding="utf-8")
+            print(f"Wrote {html_path}  (open in a browser)")
         print_find_summary(confirmed)
     finally:
         if tmpdir:
