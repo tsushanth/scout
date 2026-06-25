@@ -575,7 +575,7 @@ def render_plan_md(issue_url: str, p: Plan) -> str:
     return "\n".join(lines)
 
 
-def execute_plan(root: Path, issue_url: str, p: Plan) -> str:
+def execute_plan(root: Path, issue_url: str, p: Plan, keep: bool = True) -> str:
     executor = os.environ.get("SCOUT_EXECUTOR", "claude")
     if not shutil.which(executor):
         sys.exit(f"executor '{executor}' not found on PATH "
@@ -603,11 +603,16 @@ def execute_plan(root: Path, issue_url: str, p: Plan) -> str:
     print(hr("REVIEW — nothing has been pushed"))
     if commits:
         print("commits made on the branch:\n" + commits + "\n")
-    print("Review the diff above. If it's good, push it yourself (open the PR by "
-          "hand so your pre-flight rules apply — closedByPullRequestsReferences, "
-          "parallel PRs, repo-specific base branch, no AI attribution):")
-    print(f"  cd {root}")
-    print(f"  git push <your-fork-remote> {branch}")
+    if keep:
+        print("Review the diff above. If it's good, push it yourself (open the PR by "
+              "hand so your pre-flight rules apply — closedByPullRequestsReferences, "
+              "parallel PRs, repo-specific base branch, no AI attribution):")
+        print(f"  cd {root}")
+        print(f"  git push <your-fork-remote> {branch}")
+    else:
+        print("--no-keep: the clone is being discarded. The diff above is captured "
+              "(and in the --html artifact); re-run without --no-keep to keep the "
+              f"branch '{branch}' for pushing.")
     return diff
 
 
@@ -885,8 +890,8 @@ def main():
                 print("\nNo plan to execute — the triage forked. Re-run with "
                       "--approach N --execute.", file=sys.stderr)
             else:
-                diff = execute_plan(root, args.issue_url, rr.plan)
                 keep = not args.no_keep
+                diff = execute_plan(root, args.issue_url, rr.plan, keep=keep)
         if args.html:
             graph = None
             if rr.plan:
