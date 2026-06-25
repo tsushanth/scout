@@ -108,6 +108,26 @@ class Plan(BaseModel):
     risks: str = Field(description="What could go wrong / what the reviewer should poke at.")
 
 
+class GraphNode(BaseModel):
+    id: str = Field(description="Short stable slug used to reference this node in edges.")
+    label: str = Field(description="File path (repo-relative) or component name.")
+    kind: Literal["new", "modified", "existing"] = Field(
+        description="new = added by this change; modified = changed; existing = "
+        "untouched code the change interacts with.")
+    summary: str = Field(description="One line: what changes here, or how it's involved.")
+
+
+class GraphEdge(BaseModel):
+    src: str = Field(description="Source node id.")
+    dst: str = Field(description="Destination node id.")
+    label: str = Field(description="Relationship, e.g. 'calls', 'imports', 'feeds', 'gated by'.")
+
+
+class ChangeGraph(BaseModel):
+    nodes: list[GraphNode] = Field(description="5-12 components: the files changed plus existing pieces they touch.")
+    edges: list[GraphEdge] = Field(description="Relationships between nodes; src/dst must be defined node ids.")
+
+
 class ScanVerdict(BaseModel):
     """A fast, structured pre-filter verdict for ranking an issue queue."""
     fixable: bool = Field(
@@ -389,6 +409,22 @@ def plan(client, context, issue, chosen: str) -> Plan:
     )
 
 
+def change_graph(client, issue: str, rr: "IssueRun") -> ChangeGraph:
+    desc = render_plan_md("(this issue)", rr.plan)
+    if rr.approaches and rr.chosen_index:
+        chosen = rr.approaches.approaches[rr.chosen_index - 1]
+        desc += f"\n\nApproach fit with existing code: {chosen.codebase_fit}"
+    return parse(
+        client, ChangeGraph,
+        "Build a small CHANGE GRAPH for a reviewer of the proposed fix below: the "
+        "components involved — the files being changed AND the existing pieces they "
+        "interact with — plus the relationships between them. 5-12 nodes. Mark each "
+        "node new | modified | existing. Node label is the file path or component "
+        "name; summary is one line. Every edge's src/dst must be node ids you define.",
+        desc, issue,
+    )
+
+
 def scan_triage(client, context, issue, model: str = MODEL) -> ScanVerdict:
     return parse(
         client, ScanVerdict,
@@ -603,8 +639,127 @@ def _render_diff(diff: str) -> str:
     return "\n".join(rows)
 
 
+def split_diff_by_file(diff: str | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not diff:
+        return out
+    cur, buf = None, []
+    for ln in diff.split("\n"):
+        if ln.startswith("diff --git "):
+            if cur:
+                out[cur] = "\n".join(buf)
+            m = re.search(r" b/(\S+)$", ln)
+            cur, buf = (m.group(1) if m else None), [ln]
+        else:
+            buf.append(ln)
+    if cur:
+        out[cur] = "\n".join(buf)
+    return out
+
+
+def render_change_map(graph: "ChangeGraph", diff: str | None) -> str:
+    """A zoomable, pan-able SVG of the change; click a node to see its diff hunk."""
+    if not graph or not graph.nodes:
+        return ""
+    diffmap = split_diff_by_file(diff)
+
+    def hunk_for(label: str) -> str:
+        if label in diffmap:
+            return diffmap[label]
+        base = label.rsplit("/", 1)[-1]
+        for p, h in diffmap.items():
+            if p.endswith("/" + label) or p.rsplit("/", 1)[-1] == base:
+                return h
+        return ""
+
+    COLX = {"existing": 160, "modified": 480, "new": 800}
+    NW, NH, VGAP = 220, 60, 42
+    buckets: dict[str, list] = {"existing": [], "modified": [], "new": []}
+    for n in graph.nodes:
+        buckets.get(n.kind, buckets["modified"]).append(n)
+    pos = {}
+    for kind, arr in buckets.items():
+        for i, n in enumerate(arr):
+            pos[n.id] = (COLX.get(kind, 480), 70 + i * (NH + VGAP), n)
+    rows = max((len(a) for a in buckets.values()), default=1)
+    W, H = 960, max(70 + rows * (NH + VGAP) + 20, 200)
+
+    fill = {"existing": ("#eef1f4", "#cbd5e1", "#475569"),
+            "modified": ("#fef3c7", "#eab308", "#92400e"),
+            "new": ("#dcfce7", "#34d399", "#166534")}
+
+    edge_svg = []
+    for ed in graph.edges:
+        if ed.src not in pos or ed.dst not in pos:
+            continue
+        sx, sy, _ = pos[ed.src]
+        dx, dy, _ = pos[ed.dst]
+        x1, y1 = sx + NW / 2, sy + NH / 2
+        x2, y2 = dx - NW / 2, dy + NH / 2
+        mx = (x1 + x2) / 2
+        edge_svg.append(f'<path class=edge d="M{x1:.0f} {y1:.0f} C{mx:.0f} {y1:.0f} {mx:.0f} {y2:.0f} {x2:.0f} {y2:.0f}"/>')
+        if ed.label:
+            edge_svg.append(f'<text class=el x="{mx:.0f}" y="{(y1+y2)/2-4:.0f}">{html.escape(ed.label)}</text>')
+
+    node_svg, NODE = [], {}
+    for nid, (x, y, n) in pos.items():
+        f, b, tcol = fill.get(n.kind, fill["modified"])
+        lbl = n.label if len(n.label) <= 28 else "…" + n.label[-27:]
+        node_svg.append(
+            f'<g class=node data-id="{html.escape(nid)}" transform="translate({x-NW/2:.0f},{y:.0f})">'
+            f'<rect width="{NW}" height="{NH}" rx="10" fill="{f}" stroke="{b}" stroke-width="1.5"/>'
+            f'<text x="13" y="25" class=nl fill="{tcol}">{html.escape(lbl)}</text>'
+            f'<text x="13" y="44" class=nk fill="{tcol}">{html.escape(n.kind)}</text></g>')
+        hk = hunk_for(n.label)
+        NODE[nid] = {"label": n.label, "kind": n.kind, "summary": n.summary,
+                     "hunk": _render_diff(hk) if hk else ""}
+    nodejson = json.dumps(NODE).replace("</", "<\\/")
+
+    return f"""
+<h2>Change map <span class=dim>(scroll to zoom · drag to pan · click a node)</span></h2>
+<div class="cmapwrap">
+<style>
+.cmapwrap{{display:grid;grid-template-columns:1fr 320px;gap:14px;align-items:start;margin-bottom:8px}}
+.cmapwrap svg{{width:100%;height:460px;background:#fff;border:1px solid var(--line);border-radius:10px;cursor:grab}}
+.cmapwrap svg:active{{cursor:grabbing}}
+.node{{cursor:pointer}} .node.sel rect{{stroke:#2563eb;stroke-width:3}}
+.nl{{font:600 12.5px ui-monospace,Menlo,monospace}} .nk{{font:10px -apple-system,sans-serif;opacity:.65;text-transform:uppercase;letter-spacing:.05em}}
+.edge{{fill:none;stroke:#cbd5e1;stroke-width:1.5}} .el{{font:10px -apple-system,sans-serif;fill:#94a3b8;text-anchor:middle}}
+.cdetail{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;position:sticky;top:12px;max-height:520px;overflow:auto}}
+.cdetail .dl{{font:600 13px ui-monospace,Menlo,monospace;word-break:break-all}}
+.cdetail .dk{{font-size:10.5px;text-transform:uppercase;color:var(--dim);margin:2px 0 8px}}
+.cdetail .ds{{font-size:14px;margin-bottom:10px}}
+@media(max-width:760px){{.cmapwrap{{grid-template-columns:1fr}}}}
+</style>
+<svg id=cmap viewBox="0 0 {W} {H}" preserveAspectRatio="xMidYMid meet"><g id=cvp>{''.join(edge_svg)}{''.join(node_svg)}</g></svg>
+<div class=cdetail id=cdetail><span class=dim>Click a node to see what it changes — and its diff hunk if one exists.</span></div>
+</div>
+<script>
+(function(){{
+const NODE={nodejson},W={W},H={H};
+const svg=document.getElementById('cmap'),vp=document.getElementById('cvp'),det=document.getElementById('cdetail');
+let s=1,tx=0,ty=0,drag=null;
+const upd=()=>vp.setAttribute('transform',`translate(${{tx}},${{ty}}) scale(${{s}})`);
+const k=()=>{{const r=svg.getBoundingClientRect();return 1/Math.min(r.width/W,r.height/H);}};
+svg.addEventListener('wheel',e=>{{e.preventDefault();const r=svg.getBoundingClientRect(),kk=k();
+  const mx=(e.clientX-r.left)*kk,my=(e.clientY-r.top)*kk,ns=Math.min(4,Math.max(.3,s*(e.deltaY<0?1.12:.9)));
+  tx=mx-(mx-tx)*(ns/s);ty=my-(my-ty)*(ns/s);s=ns;upd();}},{{passive:false}});
+svg.addEventListener('mousedown',e=>drag={{x:e.clientX,y:e.clientY,tx,ty}});
+window.addEventListener('mousemove',e=>{{if(!drag)return;const kk=k();tx=drag.tx+(e.clientX-drag.x)*kk;ty=drag.ty+(e.clientY-drag.y)*kk;upd();}});
+window.addEventListener('mouseup',()=>drag=null);
+const esc=t=>(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+document.querySelectorAll('.node').forEach(g=>g.addEventListener('click',ev=>{{ev.stopPropagation();
+  document.querySelectorAll('.node').forEach(x=>x.classList.remove('sel'));g.classList.add('sel');
+  const n=NODE[g.dataset.id];if(!n)return;
+  det.innerHTML='<div class=dl>'+esc(n.label)+'</div><div class=dk>'+esc(n.kind)+'</div><div class=ds>'+esc(n.summary)+'</div>'+(n.hunk?'<pre class="diff">'+n.hunk+'</pre>':'<div class=dim>No diff hunk — run with --execute to fill this.</div>');
+}}));
+}})();
+</script>"""
+
+
 def render_issue_html(repo_name: str, title: str, issue_url: str | None,
-                      base_url: str | None, rr: "IssueRun", diff: str | None) -> str:
+                      base_url: str | None, rr: "IssueRun", diff: str | None,
+                      graph: "ChangeGraph | None" = None) -> str:
     e = html.escape
 
     def flink(path: str) -> str:
@@ -651,6 +806,8 @@ def render_issue_html(repo_name: str, title: str, issue_url: str | None,
                      f'{"".join(fcards)}'
                      f'<div class="risks"><b>risks</b> {e(p.risks)}</div>')
 
+    map_html = render_change_map(graph, diff) if graph else ""
+
     diff_html = ""
     if diff and diff.strip():
         diff_html = f'<h2>Diff <span class=dim>(written by the executor — nothing pushed)</span></h2><pre class="diff">{_render_diff(diff)}</pre>'
@@ -689,6 +846,7 @@ pre.diff .da{{color:#3fb950}} pre.diff .dr{{color:#f85149}} pre.diff .dh{{color:
 <h1>{head_title}</h1>
 <p class=repo>{e(repo_name)} &middot; scout resolution</p>
 <div class=tri><b>{e(triage_label)}</b> — {e(t.reasoning)}</div>
+{map_html}
 {appr_html}
 {plan_html}
 {diff_html}
@@ -720,7 +878,8 @@ def main():
     keep = False
     diff = None
     try:
-        rr = run(make_client(args.subscription), root, issue, args.approach)
+        client = make_client(args.subscription)
+        rr = run(client, root, issue, args.approach)
         if args.execute:
             if rr.plan is None:
                 print("\nNo plan to execute — the triage forked. Re-run with "
@@ -729,6 +888,13 @@ def main():
                 diff = execute_plan(root, args.issue_url, rr.plan)
                 keep = not args.no_keep
         if args.html:
+            graph = None
+            if rr.plan:
+                print("Building the change map...", file=sys.stderr)
+                try:
+                    graph = change_graph(client, issue, rr)
+                except Exception as exc:
+                    print(f"  (change map skipped: {exc})", file=sys.stderr)
             if args.issue_url:
                 owner, repo, number = parse_issue_url(args.issue_url)
                 base_url = f"https://github.com/{owner}/{repo}"
@@ -736,7 +902,8 @@ def main():
             else:
                 base_url, hpath = None, Path.cwd() / "scout-resolve.html"
             hpath.write_text(
-                render_issue_html(root.name, issue_title_from(issue), args.issue_url, base_url, rr, diff),
+                render_issue_html(root.name, issue_title_from(issue), args.issue_url,
+                                  base_url, rr, diff, graph),
                 encoding="utf-8")
             print(f"\nWrote {hpath}  (open in a browser)")
     finally:

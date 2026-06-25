@@ -92,10 +92,13 @@ local repo). The executor is `claude` by default; override with
 `SCOUT_EXECUTOR`.
 
 Add `--html` to any issue run for a self-contained **resolution artifact** —
-the "changes as an overview" surface: the triage verdict, the approach options
-side-by-side (chosen one highlighted), the layered plan (each file as a
-what/tested black box + risks), and — with `--execute` — the syntax-highlighted
-diff. One file, open in a browser.
+the "changes as an overview" surface: a **zoomable change-map diagram** (the
+components the change touches and how they connect — existing/modified/new,
+scroll to zoom, drag to pan, click a node to drill into its diff hunk), the
+triage verdict, the approach options side-by-side (chosen one highlighted), the
+layered plan (each file as a what/tested black box + risks), and — with
+`--execute` — the full syntax-highlighted diff. One file, open in a browser.
+The diagram is one extra structured call; everything else is templated.
 
 ```sh
 python3 scout.py --issue-url <url> --approach 1 --execute --html
