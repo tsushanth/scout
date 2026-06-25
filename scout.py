@@ -459,7 +459,16 @@ def resolve_repo_and_issue(args) -> tuple[Path, str, str | None]:
     sys.exit("Provide --issue or --issue-file (or --issue-url).")
 
 
-def run(client, root: Path, issue: str, approach_n: int | None) -> Plan | None:
+class IssueRun:
+    """The structured result of one issue resolution, for the HTML artifact."""
+    def __init__(self, triage, approaches=None, chosen_index=None, plan=None):
+        self.triage = triage
+        self.approaches = approaches      # ApproachSet | None
+        self.chosen_index = chosen_index  # 1-based | None
+        self.plan = plan                  # Plan | None
+
+
+def run(client, root: Path, issue: str, approach_n: int | None) -> IssueRun:
     print("Reading the codebase...", file=sys.stderr)
     context = gather_context(root, issue)
 
@@ -475,7 +484,7 @@ def run(client, root: Path, issue: str, approach_n: int | None) -> Plan | None:
         print("\nProceeding straight to the plan (no approach fork needed).", file=sys.stderr)
         p = plan(client, context, issue, t.single_approach_summary)
         show_plan(p)
-        return p
+        return IssueRun(triage=t, plan=p)
 
     print("Generating distinct approaches...", file=sys.stderr)
     aset = approaches(client, context, issue)
@@ -489,7 +498,7 @@ def run(client, root: Path, issue: str, approach_n: int | None) -> Plan | None:
             n = None
     if n is None:
         print(f"\nRe-run with --approach N (1-{len(aset.approaches)}) to get the plan for one.")
-        return None
+        return IssueRun(triage=t, approaches=aset)
     if not (1 <= n <= len(aset.approaches)):
         sys.exit(f"--approach must be 1..{len(aset.approaches)}")
 
@@ -498,7 +507,7 @@ def run(client, root: Path, issue: str, approach_n: int | None) -> Plan | None:
     chosen_desc = f"{chosen.name}: {chosen.summary}\nTradeoff: {chosen.tradeoffs}\nFit: {chosen.codebase_fit}"
     p = plan(client, context, issue, chosen_desc)
     show_plan(p)
-    return p
+    return IssueRun(triage=t, approaches=aset, chosen_index=n, plan=p)
 
 
 # ---- execute: hand the plan to Claude Code to write the change (stop before PR)
@@ -530,7 +539,7 @@ def render_plan_md(issue_url: str, p: Plan) -> str:
     return "\n".join(lines)
 
 
-def execute_plan(root: Path, issue_url: str, p: Plan) -> None:
+def execute_plan(root: Path, issue_url: str, p: Plan) -> str:
     executor = os.environ.get("SCOUT_EXECUTOR", "claude")
     if not shutil.which(executor):
         sys.exit(f"executor '{executor}' not found on PATH "
@@ -550,9 +559,9 @@ def execute_plan(root: Path, issue_url: str, p: Plan) -> None:
     subprocess.run([executor, "--print", plan_md, "--allowedTools", "Edit,Write,Bash"], cwd=str(root))
 
     subprocess.run([*git, "add", "-A"])
+    diff = subprocess.check_output([*git, "--no-pager", "diff", "--cached", base], text=True)
     print(hr("DIFF (all changes vs. clone base)"))
-    sys.stdout.flush()
-    subprocess.run([*git, "--no-pager", "diff", "--cached", base])
+    print(diff)
     commits = subprocess.check_output([*git, "log", "--oneline", f"{base}..HEAD"], text=True).strip()
 
     print(hr("REVIEW — nothing has been pushed"))
@@ -563,6 +572,128 @@ def execute_plan(root: Path, issue_url: str, p: Plan) -> None:
           "parallel PRs, repo-specific base branch, no AI attribution):")
     print(f"  cd {root}")
     print(f"  git push <your-fork-remote> {branch}")
+    return diff
+
+
+def issue_title_from(issue: str, fallback: str = "Issue") -> str:
+    for line in issue.splitlines():
+        if line.startswith("TITLE:"):
+            return line[6:].strip() or fallback
+    for line in issue.splitlines():
+        if line.strip():
+            return line.strip()[:90]
+    return fallback
+
+
+def _render_diff(diff: str) -> str:
+    rows = []
+    for ln in diff.split("\n"):
+        e = html.escape(ln)
+        if ln.startswith(("+++", "---", "diff ", "index ")):
+            cls = "dm"
+        elif ln.startswith("+"):
+            cls = "da"
+        elif ln.startswith("-"):
+            cls = "dr"
+        elif ln.startswith("@@"):
+            cls = "dh"
+        else:
+            cls = ""
+        rows.append(f'<span class="{cls}">{e}</span>' if cls else e)
+    return "\n".join(rows)
+
+
+def render_issue_html(repo_name: str, title: str, issue_url: str | None,
+                      base_url: str | None, rr: "IssueRun", diff: str | None) -> str:
+    e = html.escape
+
+    def flink(path: str) -> str:
+        p = e(path)
+        if base_url:
+            return f'<a href="{base_url}/blob/HEAD/{p}" target="_blank" rel="noopener"><code>{p}</code></a>'
+        return f"<code>{p}</code>"
+
+    t = rr.triage
+    head_title = f'<a href="{e(issue_url)}" target="_blank" rel="noopener">{e(title)}</a>' if issue_url else e(title)
+    forked = t.needs_approach_choice
+    triage_label = "Approach fork — a real decision to make" if forked else "One obvious approach"
+    triage_col = "#b9770e" if forked else "#15803d"
+
+    appr_html = ""
+    if rr.approaches:
+        cards = []
+        for i, a in enumerate(rr.approaches.approaches, 1):
+            chosen = (rr.chosen_index == i)
+            files = " ".join(flink(x) for x in a.files_to_touch) or "<span class=dim>—</span>"
+            badge = '<span class="cho">✓ chosen</span>' if chosen else ""
+            cards.append(f"""
+      <div class="appr{' won' if chosen else ''}">
+        <div class="ah"><span class="an">{i}. {e(a.name)}</span>{badge}</div>
+        <div class="asum">{e(a.summary)}</div>
+        <div class="arow"><b>tradeoff</b> {e(a.tradeoffs)}</div>
+        <div class="arow"><b>fit</b> {e(a.codebase_fit)}</div>
+        <div class="arow"><b>touches</b> {files}</div>
+      </div>""")
+        appr_html = f'<h2>Approaches</h2><div class="grid">{"".join(cards)}</div>'
+
+    plan_html = ""
+    if rr.plan:
+        p = rr.plan
+        fcards = []
+        for fc in p.files:
+            fcards.append(f"""
+      <div class="fc">
+        <div class="fp">{flink(fc.path)}</div>
+        <div class="frow"><b>does</b> {e(fc.what_it_does)}</div>
+        <div class="frow"><b>tested</b> {e(fc.how_tested)}</div>
+      </div>""")
+        plan_html = (f'<h2>Plan</h2><div class="summary">{e(p.approach_recap)}</div>'
+                     f'{"".join(fcards)}'
+                     f'<div class="risks"><b>risks</b> {e(p.risks)}</div>')
+
+    diff_html = ""
+    if diff and diff.strip():
+        diff_html = f'<h2>Diff <span class=dim>(written by the executor — nothing pushed)</span></h2><pre class="diff">{_render_diff(diff)}</pre>'
+
+    return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>scout · {e(title)}</title>
+<style>
+:root{{--bg:#fafafa;--card:#fff;--line:#e5e7eb;--ink:#1f2937;--dim:#6b7280}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}}
+.wrap{{max-width:980px;margin:0 auto;padding:32px 20px 80px}}
+h1{{font-size:21px;margin:0 0 2px}} h1 a{{color:var(--ink)}}
+.repo{{color:var(--dim);font-size:13px;margin:0 0 18px}}
+.tri{{border-left:4px solid {triage_col};background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 16px;margin:0 0 8px}}
+.tri b{{color:{triage_col}}}
+h2{{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:30px 0 12px}}
+.summary{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin:0 0 14px}}
+code{{background:#f1f3f5;border-radius:4px;padding:1px 5px;font-size:12.5px}}
+a code{{background:#eef2ff;color:#3730a3}}
+.grid{{display:flex;gap:14px;flex-wrap:wrap}}
+.appr{{flex:1 1 280px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;opacity:.82}}
+.appr.won{{opacity:1;border-color:#15803d;box-shadow:0 0 0 1px #15803d}}
+.ah{{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px}}
+.an{{font-weight:700}} .cho{{font-size:11px;font-weight:700;color:#fff;background:#15803d;border-radius:5px;padding:2px 7px}}
+.asum{{font-size:14px;margin-bottom:8px}}
+.arow,.frow{{font-size:13px;color:#374151;margin:5px 0}} .arow b,.frow b{{color:var(--dim);text-transform:uppercase;font-size:11px;letter-spacing:.04em;margin-right:6px}}
+.fc{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 10px}}
+.fp{{font-weight:600;margin-bottom:6px}}
+.risks{{background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:12px 14px;margin:8px 0;font-size:13.5px}}
+.risks b{{color:#b9770e;text-transform:uppercase;font-size:11px;letter-spacing:.04em;margin-right:6px}}
+pre.diff{{background:#0d1117;color:#c9d1d9;border-radius:10px;padding:16px;overflow:auto;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}}
+pre.diff .da{{color:#3fb950}} pre.diff .dr{{color:#f85149}} pre.diff .dh{{color:#58a6ff}} pre.diff .dm{{color:#8b949e}}
+.dim{{color:var(--dim)}} footer{{color:var(--dim);font-size:12px;margin-top:32px}}
+</style></head><body><div class=wrap>
+<h1>{head_title}</h1>
+<p class=repo>{e(repo_name)} &middot; scout resolution</p>
+<div class=tri><b>{e(triage_label)}</b> — {e(t.reasoning)}</div>
+{appr_html}
+{plan_html}
+{diff_html}
+<footer>Generated by <code>scout</code>. Plan is a proposal; the diff (if any) was written on a throwaway clone and not pushed.</footer>
+</div></body></html>"""
 
 
 def main():
@@ -576,6 +707,8 @@ def main():
                     help="After the plan, hand it to Claude Code to write the change (stops before PR). Requires --issue-url.")
     ap.add_argument("--no-keep", action="store_true",
                     help="With --execute, delete the clone on exit instead of keeping it for you to push.")
+    ap.add_argument("--html", action="store_true",
+                    help="Emit a self-contained interactive artifact: triage → approaches → plan → diff.")
     ap.add_argument("--subscription", action="store_true",
                     help="Use your Claude Code subscription for the planning calls too (never an API key).")
     args = ap.parse_args()
@@ -585,15 +718,27 @@ def main():
 
     root, issue, tmpdir = resolve_repo_and_issue(args)
     keep = False
+    diff = None
     try:
-        p = run(make_client(args.subscription), root, issue, args.approach)
+        rr = run(make_client(args.subscription), root, issue, args.approach)
         if args.execute:
-            if p is None:
+            if rr.plan is None:
                 print("\nNo plan to execute — the triage forked. Re-run with "
                       "--approach N --execute.", file=sys.stderr)
             else:
-                execute_plan(root, args.issue_url, p)
+                diff = execute_plan(root, args.issue_url, rr.plan)
                 keep = not args.no_keep
+        if args.html:
+            if args.issue_url:
+                owner, repo, number = parse_issue_url(args.issue_url)
+                base_url = f"https://github.com/{owner}/{repo}"
+                hpath = Path.cwd() / f"RESOLVE-{repo}-{number}.html"
+            else:
+                base_url, hpath = None, Path.cwd() / "scout-resolve.html"
+            hpath.write_text(
+                render_issue_html(root.name, issue_title_from(issue), args.issue_url, base_url, rr, diff),
+                encoding="utf-8")
+            print(f"\nWrote {hpath}  (open in a browser)")
     finally:
         if tmpdir and not keep:
             shutil.rmtree(tmpdir, ignore_errors=True)

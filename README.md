@@ -91,6 +91,17 @@ branch, no AI attribution). The clone is kept so you can `cd` in and push
 local repo). The executor is `claude` by default; override with
 `SCOUT_EXECUTOR`.
 
+Add `--html` to any issue run for a self-contained **resolution artifact** —
+the "changes as an overview" surface: the triage verdict, the approach options
+side-by-side (chosen one highlighted), the layered plan (each file as a
+what/tested black box + risks), and — with `--execute` — the syntax-highlighted
+diff. One file, open in a browser.
+
+```sh
+python3 scout.py --issue-url <url> --approach 1 --execute --html
+# → RESOLVE-<repo>-<n>.html
+```
+
 ### Find mode — discover latent issues, write OVERVIEW.md
 
 Where `scan`/`--issue-url` *consume* reported issues, `find` *produces* them:
