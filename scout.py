@@ -60,6 +60,7 @@ CODE_EXTS = {
 MAX_TREE_ENTRIES = 400
 MAX_RELEVANT_FILES = 8
 MAX_FILE_CHARS = 6000
+DIGEST_FILE_CHARS = 16000  # deeper per-file cap for the whole-repo `find` audit
 
 
 # ---- structured-output schemas (validated by the SDK; the model retries on mismatch)
@@ -150,12 +151,12 @@ def build_tree(root: Path) -> str:
     return "\n".join(lines)
 
 
-def read_capped(path: Path) -> str:
+def read_capped(path: Path, cap: int = MAX_FILE_CHARS) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
-    return text[:MAX_FILE_CHARS] + ("\n... (truncated)" if len(text) > MAX_FILE_CHARS else "")
+    return text[:cap] + ("\n... (truncated)" if len(text) > cap else "")
 
 
 def keywords(issue: str) -> list[str]:
@@ -838,10 +839,280 @@ def sweep_main(argv):
     print(f"\n  Saved {len(all_gos)} GOs to {args.save}", file=sys.stderr)
 
 
+# ---- find: audit a repo for latent issues, write an OVERVIEW.md
+
+class Area(BaseModel):
+    name: str = Field(description="Name of the functional area / module.")
+    does: str = Field(description="What this area does, in one sentence.")
+    key_files: list[str] = Field(description="A few repo-relative key files in this area.")
+
+
+class RepoMap(BaseModel):
+    summary: str = Field(description="One paragraph: what this repo is and does.")
+    areas: list[Area] = Field(description="The main functional areas.")
+    test_shape: str = Field(description="How the project is tested (frameworks, where tests live, gaps).")
+
+
+class Finding(BaseModel):
+    title: str = Field(description="Short, specific title of the issue.")
+    category: Literal["bug", "health"] = Field(description="Correctness bug, or engineering-health item.")
+    kind: Literal[
+        "logic_error", "unhandled_error", "edge_case", "race", "resource_leak",
+        "wrong_api_usage", "dead_code", "missing_test", "inconsistency",
+        "risky_todo", "perf", "other",
+    ] = Field(description="The specific kind of issue.")
+    file: str = Field(description="Repo-relative path of the file the issue is in.")
+    locator: str = Field(description="Function/symbol/region pointing at the code (not whole-file).")
+    evidence: str = Field(description="Why it's a problem, referencing the specific code.")
+    proposed_change: str = Field(description="One-line direction for the fix.")
+    severity: Literal["high", "medium", "low"] = Field(description="Impact if left unfixed.")
+
+
+class FindingSet(BaseModel):
+    findings: list[Finding] = Field(description="Concrete, code-grounded findings. Fewer is fine; none if clean.")
+
+
+class Verdict(BaseModel):
+    real: bool = Field(description="True only if the finding is a genuine issue confirmable from the code.")
+    confidence: float = Field(description="0.0-1.0 confidence that it's real.")
+    severity: Literal["high", "medium", "low"] = Field(description="Re-assessed severity.")
+    rationale: str = Field(description="Why it's real, or why it's refuted (handled elsewhere / false positive).")
+    proposed_change: str = Field(description="Tightened one-line fix (if real).")
+
+
+SOURCE_HINT_DIRS = ("src/", "lib/", "app/", "core/", "pkg/", "internal/", "packages/", "cmd/")
+TEST_HINTS = (".test.", ".spec.", "_test.", "/tests/", "/__tests__/", "/test/", "/spec/")
+GEN_HINTS = ("generated", "/dist/", "/build/", ".min.", "/vendor/", ".pb.")
+SEV_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def digest_files(root: Path, max_files: int) -> list[tuple[str, Path]]:
+    """Pick the most central source files for a whole-repo audit digest."""
+    cand: list[tuple[int, int, str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith(".")]
+        for f in filenames:
+            p = Path(dirpath) / f
+            if p.suffix.lower() not in CODE_EXTS:
+                continue
+            try:
+                sz = p.stat().st_size
+            except Exception:
+                continue
+            if sz > 200_000 or sz < 60:
+                continue
+            rel = str(p.relative_to(root)).replace("\\", "/")
+            low = rel.lower()
+            score = 0
+            if any(h in low for h in SOURCE_HINT_DIRS):
+                score += 3
+            if any(h in low for h in TEST_HINTS):
+                score -= 2
+            if any(h in low for h in GEN_HINTS):
+                score -= 4
+            score -= rel.count("/")          # prefer shallower
+            if 800 <= sz <= 20000:
+                score += 1                   # prefer meaty-but-readable files
+            cand.append((score, -sz, rel, p))
+    cand.sort(key=lambda t: (-t[0], t[1]))
+    return [(rel, p) for _, _, rel, p in cand[:max_files]]
+
+
+def repo_digest(root: Path, max_files: int) -> tuple[str, list[str]]:
+    parts = [f"# Repo: {root.name}\n", "## File tree\n", build_tree(root), "\n"]
+    for cand in ("README.md", "readme.md", "README.rst", "README"):
+        rp = root / cand
+        if rp.exists():
+            parts += ["## README\n", read_capped(rp), "\n"]
+            break
+    files = digest_files(root, max_files)
+    parts.append(f"\n## Source files ({len(files)} sampled for audit)\n")
+    for rel, p in files:
+        parts += [f"\n### {rel}\n```\n", read_capped(p, DIGEST_FILE_CHARS), "\n```\n"]
+    return "".join(parts), [rel for rel, _ in files]
+
+
+def audit_call(client, schema, instruction: str, context: str, model: str):
+    return client.messages.parse(
+        model=model, max_tokens=16000, thinking={"type": "adaptive"},
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"{instruction}\n\n=== CODEBASE ===\n{context}"}],
+        output_format=schema,
+    ).parsed_output
+
+
+def comprehend(client, digest: str, model: str) -> RepoMap:
+    return audit_call(
+        client, RepoMap,
+        "Map this repository for a newcomer: a one-paragraph summary of what it is "
+        "and does, the main functional areas (name, what each does, key files), and "
+        "how it's tested (including obvious gaps).",
+        digest, model,
+    )
+
+
+LENSES = {
+    "bug": "Find concrete CORRECTNESS bugs: logic errors, unhandled errors/exceptions, "
+           "edge cases, off-by-one, race conditions, resource leaks, incorrect API usage.",
+    "health": "Find ENGINEERING-HEALTH issues: dead/unreachable code, missing tests on "
+              "important paths, inconsistent patterns, risky TODO/FIXME, clear performance "
+              "footguns, fragile error handling.",
+}
+
+
+def discover(client, digest: str, lens: str, model: str, cap: int) -> list[Finding]:
+    instr = (
+        f"{LENSES[lens]} Report up to {cap} of the most important, each grounded in "
+        "specific code you can point to (file + symbol/region) with a one-line fix. "
+        "Do NOT invent issues or give generic advice; if the code is clean, return "
+        "fewer or none. Only report what you can defend from the code shown."
+    )
+    return audit_call(client, FindingSet, instr, digest, model).findings
+
+
+def verify(client, root: Path, f: Finding, model: str) -> Verdict:
+    fp = root / f.file
+    code = read_capped(fp, DIGEST_FILE_CHARS) if fp.exists() else "(file not present at that path in the repo)"
+    instr = (
+        "Adversarially VERIFY this finding against the actual file below. Try to "
+        "REFUTE it: is it a real issue, or is it already handled, a false positive, "
+        "or not reproducible? Default real=false if you cannot confirm it from the "
+        "code. If real, give severity and a tightened one-line fix.\n\n"
+        f"=== FINDING ===\ntitle: {f.title}\nfile: {f.file}\nkind: {f.kind}\n"
+        f"locator: {f.locator}\nevidence: {f.evidence}\nproposed: {f.proposed_change}"
+    )
+    return audit_call(client, Verdict, instr, f"### {f.file}\n```\n{code}\n```", model)
+
+
+def dedup_findings(findings: list[Finding]) -> list[Finding]:
+    seen, out = set(), []
+    for f in findings:
+        k = (f.file.lower(), f.title.lower()[:50])
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def write_overview(path: Path, root: Path, rmap: RepoMap, sampled: list[str],
+                   confirmed: list[tuple[Finding, Verdict]], n_candidates: int):
+    L = [
+        f"# Overview — {root.name}",
+        "",
+        "_Generated by `scout find`: an LLM audit of the codebase. Findings are "
+        "adversarially verified but are still **candidates** — confirm before acting. "
+        f"This audit sampled {len(sampled)} source files, so it is not exhaustive._",
+        "",
+        "## What this is",
+        "",
+        rmap.summary,
+        "",
+        "## Map",
+        "",
+    ]
+    for a in rmap.areas:
+        links = ", ".join(f"[`{kf}`]({kf})" for kf in a.key_files)
+        L += [f"- **{a.name}** — {a.does}", f"  - {links}" if links else "", ""]
+    L += ["## Test shape", "", rmap.test_shape, "",
+          f"## Findings — {len(confirmed)} verified (of {n_candidates} candidates)", ""]
+    if not confirmed:
+        L.append("_No findings survived verification in this pass._")
+    for f, v in confirmed:
+        L += [
+            f"### [{v.severity.upper()}] {f.title}  · `{f.category}/{f.kind}`",
+            f"- **where:** [`{f.file}`]({f.file}) — {f.locator}",
+            f"- **why:** {v.rationale}",
+            f"- **fix:** {v.proposed_change}",
+            f"- **confidence:** {v.confidence:.2f}",
+            "",
+        ]
+    L += ["---", "",
+          "Resolve any finding with scout:", "",
+          "```sh",
+          "scout.py <repo> --issue \"<paste the finding's title + why>\"",
+          "```", ""]
+    path.write_text("\n".join(L), encoding="utf-8")
+
+
+def print_find_summary(confirmed: list[tuple[Finding, Verdict]]):
+    print(hr(f"VERIFIED FINDINGS — {len(confirmed)}"))
+    for f, v in confirmed:
+        print(f"\n  [{v.severity.upper()}] {f.title}  ({f.category}/{f.kind}, conf {v.confidence:.2f})")
+        print(f"      {f.file} — {f.locator}")
+        print(f"      fix: {v.proposed_change}")
+
+
+def find_main(argv):
+    ap = argparse.ArgumentParser(prog="scout find",
+                                 description="Audit a repo: discover + verify latent issues, write OVERVIEW.md.")
+    ap.add_argument("repo", help="Local repo path OR a github repo URL (shallow-cloned).")
+    ap.add_argument("--model", default=MODEL, help=f"Model (default {MODEL}).")
+    ap.add_argument("--max-files", type=int, default=24, help="Source files to sample into the digest.")
+    ap.add_argument("--per-lens", type=int, default=8, help="Max candidate findings per lens.")
+    ap.add_argument("--workers", type=int, default=5, help="Concurrent verification calls.")
+    ap.add_argument("--out", default="OVERVIEW.md", help="Artifact filename written into a local repo.")
+    ap.add_argument("--subscription", action="store_true",
+                    help="Use your Claude Code subscription instead of an API key.")
+    args = ap.parse_args(argv)
+
+    tmpdir = None
+    if args.repo.startswith("http"):
+        owner, repo = parse_repo_url(args.repo)
+        tmpdir = tempfile.mkdtemp(prefix="scout-")
+        root = Path(tmpdir) / repo
+        print(f"Cloning {owner}/{repo} (shallow)...", file=sys.stderr)
+        clone_repo(owner, repo, str(root))
+        out_path = Path.cwd() / f"OVERVIEW-{repo}.md"  # survives clone cleanup
+    else:
+        root = Path(args.repo).expanduser().resolve()
+        if not root.is_dir():
+            sys.exit(f"Not a directory: {root}")
+        out_path = root / args.out
+
+    client = make_client(args.subscription)
+    try:
+        print("Building repo digest...", file=sys.stderr)
+        digest, sampled = repo_digest(root, args.max_files)
+        print(f"  sampled {len(sampled)} source files", file=sys.stderr)
+
+        print("Comprehending the codebase...", file=sys.stderr)
+        rmap = comprehend(client, digest, args.model)
+
+        print("Discovering issues (bug + health lenses)...", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            lens_res = list(ex.map(
+                lambda lens: discover(client, digest, lens, args.model, args.per_lens),
+                ["bug", "health"]))
+        cands = dedup_findings([f for r in lens_res for f in r])
+        print(f"  {len(cands)} candidate findings; verifying (adversarial)...", file=sys.stderr)
+
+        def _ver(f):
+            try:
+                return (f, verify(client, root, f, args.model))
+            except Exception:
+                return (f, None)
+
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            verdicts = list(ex.map(_ver, cands))
+        confirmed = [(f, v) for f, v in verdicts if v and v.real]
+        confirmed.sort(key=lambda fv: (SEV_RANK.get(fv[1].severity, 3), -fv[1].confidence))
+        print(f"  {len(confirmed)} verified (dropped {len(cands) - len(confirmed)} unverified)", file=sys.stderr)
+
+        write_overview(out_path, root, rmap, sampled, confirmed, len(cands))
+        print(f"\nWrote {out_path}")
+        print_find_summary(confirmed)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "scan":
+    sub = sys.argv[1] if len(sys.argv) > 1 else None
+    if sub == "scan":
         scan_main(sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "sweep":
+    elif sub == "sweep":
         sweep_main(sys.argv[2:])
+    elif sub == "find":
+        find_main(sys.argv[2:])
     else:
         main()

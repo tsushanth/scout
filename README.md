@@ -91,6 +91,32 @@ branch, no AI attribution). The clone is kept so you can `cd` in and push
 local repo). The executor is `claude` by default; override with
 `SCOUT_EXECUTOR`.
 
+### Find mode — discover latent issues, write OVERVIEW.md
+
+Where `scan`/`--issue-url` *consume* reported issues, `find` *produces* them:
+it audits the code itself for issues nobody has filed yet.
+
+```sh
+python3 scout.py find ~/some/repo                 # writes OVERVIEW.md into the repo
+python3 scout.py find https://github.com/owner/repo  # clones; writes ./OVERVIEW-<repo>.md
+```
+
+Pipeline: **comprehend** (map modules/areas/test-shape) → **discover** (two
+lenses — correctness bugs *and* engineering health) → **verify** (an
+adversarial refute pass on every candidate, concurrent — the gate that keeps it
+from being a slop generator) → write an `OVERVIEW.md` with the code map plus the
+*verified* findings, each ranked by severity with `file` evidence links and a
+one-line proposed fix.
+
+Any finding then hands to the resolver: `scout.py <repo> --issue "<finding>"` →
+triage → approaches → plan → execute. So the loop closes — **find** discovers,
+the **overview** presents, **scout** resolves.
+
+Knobs: `--per-lens N` (candidates per lens), `--max-files N` (source files
+sampled into the digest), `--workers N` (concurrent verification), `--model`,
+`--subscription`. Large files are sampled, not read whole — per-file chunking is
+the next step for very large modules.
+
 `--approach N` skips the interactive prompt (use it in non-TTY contexts, or to
 re-run after seeing the fork).
 
